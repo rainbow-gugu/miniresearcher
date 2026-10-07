@@ -75,12 +75,13 @@ def research_team_node(state: State) -> Command[Literal["researcher", "coder", "
     if not plan or not plan.steps:
         return Command(goto="planner")
 
-    # 所有步骤都执行完了 → 回到规划师判断信息够不够
-    if all(step.execution_res is not None for step in plan.steps):
+    # 没有待执行步骤了（全部 done，或含 failed）→ 回到规划师判断/重规划
+    pending_steps = [s for s in plan.steps if s.status == "pending"]
+    if not pending_steps:
         return Command(goto="planner")
 
-    # 找第一个没执行的步骤
-    next_step = next(s for s in plan.steps if s.execution_res is None)
+    # 取第一个待执行的步骤
+    next_step = pending_steps[0]
 
     # 按类型分发
     if next_step.step_type == "processing":
@@ -91,19 +92,30 @@ def research_team_node(state: State) -> Command[Literal["researcher", "coder", "
 async def _run_agent_step(state: State, agent, agent_name: str):
     """通用逻辑：让 Agent 执行当前步骤，把结果写回计划。"""
     plan = state.get("current_plan")
-    next_step = next(s for s in plan.steps if s.execution_res is None)
+    next_step = next(s for s in plan.steps if s.status == "pending")
+
+    # 标记为执行中
+    next_step.status = "running"
 
     # 构造给 Agent 的任务描述
     task = f"步骤标题：{next_step.title}\n具体要求：{next_step.description}"
-    result = await agent.ainvoke({"messages": [HumanMessage(content=task)]})
 
-    # Agent 的最终回答
-    answer = result["messages"][-1].content
-    next_step.execution_res = answer
+    try:
+        result = await agent.ainvoke({"messages": [HumanMessage(content=task)]})
+        # Agent 的最终回答
+        answer = result["messages"][-1].content
+        # 标记完成并写回结果
+        next_step.status = "done"
+        next_step.execution_res = answer
+    except Exception as e:
+        # 标记失败，错误信息也作为结果，方便规划师据此调整
+        answer = f"步骤执行失败: {repr(e)}"
+        next_step.status = "failed"
+        next_step.execution_res = answer
 
     return Command(
         update={
-            "observations": state.get("observations", []) + [answer],
+            "observations": [answer],  # 只返回新增，add reducer 自动与旧列表拼接
             "current_plan": plan,
         },
         goto="research_team",
