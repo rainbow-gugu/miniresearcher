@@ -12,14 +12,24 @@ async def run(question: str):
     inputs = {"messages": [HumanMessage(content=question)]}
     final_state = None
 
-    # 流式执行：只执行一次，实时观察节点动作，最后一次快照即最终状态
-    async for event in graph.astream(inputs, stream_mode="values"):
-        final_state = event
-        # 从 messages 最后一条判断当前进度
-        last = event["messages"][-1]
-        name = getattr(last, "name", None) or last.__class__.__name__
-        print(f"  ... {name} 处理中")
+    # 同时订阅两种流：
+    #   updates → 每次节点执行完，告诉你「刚才是哪个节点跑了」
+    #   values  → 当前完整状态快照，用它取最终结果
+    async for mode, chunk in graph.astream(inputs, stream_mode=["updates", "values"]):
+        if mode == "values":
+            final_state = chunk
+            continue
 
+        # mode == "updates" 时，chunk 形如 {"节点名": 该节点返回的 update}
+
+        for node_name, update in chunk.items():
+            print(f"  ▶ {node_name}")
+            if node_name in ("researcher", "coder") and isinstance(update, dict):
+                plan = update.get("current_plan")
+                if plan and plan.steps:
+                    done = [s for s in plan.steps if s.status == "done"]
+                    if done:
+                        print(f"      ✓ {done[-1].title}")
     return final_state.get("final_report", "") if final_state else ""
 
 
