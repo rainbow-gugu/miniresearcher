@@ -32,7 +32,10 @@ def coordinator_node(state: State) -> Command[Literal["planner", "__end__"]]:
     if response.tool_calls:
         return Command(goto="planner")
     return Command(
-        update={"messages": [response]},
+        update={
+            "messages": [response],
+            "final_report":response.content,
+        },
         goto="__end__",
     )
 
@@ -68,25 +71,31 @@ def planner_node(state: State) -> Command[Literal["research_team", "reporter"]]:
     )
 
 
-def research_team_node(state: State) -> Command[Literal["researcher", "coder", "planner"]]:
+def research_team_node(state: State) -> Command[Literal["researcher", "coder", "planner", "reporter"]]:
     """调度器：找下一个未执行的步骤，分发给对应 Agent。"""
     plan = state.get("current_plan")
 
     if not plan or not plan.steps:
         return Command(goto="planner")
 
-    # 没有待执行步骤了（全部 done，或含 failed）→ 回到规划师判断/重规划
+    # 还有待执行的步骤 → 取第一个，按类型分发
     pending_steps = [s for s in plan.steps if s.status == "pending"]
-    if not pending_steps:
+    if pending_steps:
+        next_step = pending_steps[0]
+        if next_step.step_type == "processing":
+            return Command(goto="coder")
+        return Command(goto="researcher")
+
+    # 没有待执行步骤了，要区分两种情况：
+    failed_steps = [s for s in plan.steps if s.status == "failed"]
+    if failed_steps:
+        # 有步骤失败 → 回规划师，让它决定换个路子还是放弃
         return Command(goto="planner")
 
-    # 取第一个待执行的步骤
-    next_step = pending_steps[0]
-
-    # 按类型分发
-    if next_step.step_type == "processing":
-        return Command(goto="coder")
-    return Command(goto="researcher")
+    # 全部成功 → 直接去写报告。
+    # 这里绝对不能回 planner：planner 会重建一份全新的 pending 计划，
+    # 导致同样的研究被重复做一遍（实测重复了 6 个步骤、成本翻倍）。
+    return Command(goto="reporter")
 
 
 async def _run_agent_step(state: State, agent, agent_name: str):
@@ -97,8 +106,18 @@ async def _run_agent_step(state: State, agent, agent_name: str):
     # 标记为执行中
     next_step.status = "running"
 
-    # 构造给 Agent 的任务描述
-    task = f"步骤标题：{next_step.title}\n具体要求：{next_step.description}"
+    # 构造给 Agent 的任务描述。
+    # 关键：必须把「总目标」和「前序步骤已获得的资料」一起喂进去，
+    # 否则子 Agent 不知道上下文，会瞎猜，甚至去磁盘翻出上个任务的遗留文件当成果。
+    previous = "\n\n".join(state.get("observations", []))
+    context = previous if previous.strip() else "（这是第一步，暂无已有资料）"
+
+    task = (
+        f"【总目标】{plan.title}\n"
+        f"【当前步骤】{next_step.title}\n"
+        f"【具体要求】{next_step.description}\n"
+        f"\n【前序步骤已获得的资料】\n{context}"
+    )
 
     try:
         result = await agent.ainvoke({"messages": [HumanMessage(content=task)]})
